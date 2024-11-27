@@ -1,0 +1,621 @@
+se import asyncio
+import discord
+from discord.ext import commands
+import aiohttp
+import threading
+import queue
+import tkinter as tk
+from tkinter import scrolledtext, font, simpledialog
+from openai import OpenAI
+import speech_recognition as sr
+from ctypes import cast, POINTER
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+import subprocess
+import os
+import re
+import ctypes
+import pystray
+from PIL import Image, ImageTk
+import time
+import concurrent.futures
+import screen_brightness_control as sbc
+import traceback
+import sys
+import logging
+import psutil
+import webbrowser
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import json
+
+DISCORD_TOKEN = 'secretoo'  # Reemplaza esto con tu token real
+ADMIN_PASSWORD = '69420'
+
+# Configuración del logging
+logging.basicConfig(filename='jarvis_log.txt', level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Suprimimos los mensajes de logging de discord
+logging.getLogger('discord').setLevel(logging.ERROR)
+logging.getLogger('discord.http').setLevel(logging.ERROR)
+logging.getLogger('discord.gateway').setLevel(logging.ERROR)
+
+# Desactivamos las advertencias de asyncio
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="coroutine .* was never awaited")
+
+class AsistenteAsus:
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.ventana_registros = None
+        self.texto_registros = None
+        self.ejecutando = True
+        self.aplicaciones = {
+            "opera": r"C:\Users\Maxi\AppData\Local\Programs\Opera GX\launcher.exe",
+            "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "word": r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
+            "excel": r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
+            "notepad": r"C:\Windows\System32\notepad.exe",
+        }
+        self.volumen = self.obtener_control_volumen()
+        self.icon = None
+        self.icon_path = os.path.join(os.path.expanduser("~"), "Desktop", "jarvis.ico")
+        self.bot = None
+        self.session = None
+        self.comando_queue = queue.Queue()
+        self.discord_connected = False
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        self.registro_comandos = []
+        self.queue = queue.Queue()
+        self.discord_loop = None
+        self.ADMIN_PASSWORD = '153515'
+        self.apagado_programado = False
+        self.reinicio_programado = False
+        self.ventana_imagen = None
+        self.imagen_path = os.path.join(os.path.expanduser("~"), "Desktop", "kebab.jfif")
+        self.config_file = "jarvis_config.json"
+        self.load_config()
+
+    def load_config(self):
+        try:
+            with open(self.config_file, 'r') as f:
+                self.config = json.load(f)
+        except FileNotFoundError:
+            self.config = {"volumen_predeterminado": 50, "brillo_predeterminado": 70}
+            self.save_config()
+
+    def save_config(self):
+        with open(self.config_file, 'w') as f:
+            json.dump(self.config, f)
+
+    async def modificar_configuracion(self, comando):
+        if "cambiar volumen predeterminado" in comando:
+            nuevo_volumen = self.extraer_numero(comando, 50)
+            self.config["volumen_predeterminado"] = nuevo_volumen
+            self.save_config()
+            return f"Volumen predeterminado cambiado a {nuevo_volumen}%"
+        elif "cambiar brillo predeterminado" in comando:
+            nuevo_brillo = self.extraer_numero(comando, 70)
+            self.config["brillo_predeterminado"] = nuevo_brillo
+            self.save_config()
+            return f"Brillo predeterminado cambiado a {nuevo_brillo}%"
+        return "No se reconoció el comando de configuración"
+
+    async def setup_discord_bot(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        self.bot = commands.Bot(command_prefix='!', intents=intents)
+
+        @self.bot.event
+        async def on_ready():
+            self.discord_connected = True
+            self.agregar_registro(f'Jarvis se ha iniciado en Discord como {self.bot.user}')
+
+        @self.bot.command(name='jarvis')
+        async def jarvis_command(ctx, *, comando):
+            try:
+                if comando.startswith('pass'):
+                    password = comando[4:]
+                    if password == self.ADMIN_PASSWORD:
+                        await ctx.send("Contraseña correcta. ¿Qué acción deseas realizar?")
+                        def check(m):
+                            return m.author == ctx.author and m.channel == ctx.channel
+                        try:
+                            msg = await self.bot.wait_for('message', check=check, timeout=30.0)
+                            respuesta = await self.procesar_comando(msg.content, from_discord=True, admin=True)
+                        except asyncio.TimeoutError:
+                            respuesta = "Tiempo de espera agotado."
+                    else:
+                        respuesta = "Contraseña incorrecta."
+                else:
+                    respuesta = await self.procesar_comando(comando, from_discord=True, admin=False)
+                await ctx.send(respuesta)
+                self.agregar_registro(f"Comando de Discord ejecutado: {comando}\nRespuesta: {respuesta}")
+            except Exception as e:
+                error_msg = f"Error al procesar comando de Discord: {e}"
+                self.agregar_registro(error_msg)
+                await ctx.send(f"Lo siento, ocurrió un error: {e}")
+
+        @self.bot.command(name='ayuda')
+        async def ayuda_command(ctx):
+            ayuda = """
+            Comandos disponibles:
+            • !jarvis hola - Para saludar
+            • !jarvis volumen [subir/bajar] [nivel] - Para ajustar el volumen
+            • !jarvis brillo [subir/bajar] [nivel] - Para ajustar el brillo
+            • !jarvis abrir [aplicación] - Para abrir una aplicación
+            • !jarvis buscar [término] - Para buscar algo en Google
+            • !jarvis abrir opción [número] - Para abrir un resultado específico de la búsqueda
+            • !jarvis clima [ciudad] - Para consultar el clima
+            • !jarvis chiste - Para contar un chiste
+            • !jarvis bloquear - Para bloquear el equipo
+            • !jarvis bateria - Para ver el nivel de batería
+            • !jarvis desmutear - Para quitar el mute del sistema
+            • !jarvis pass[contraseña] - Para acceder a comandos de administrador
+            """
+            await ctx.send(ayuda)
+
+        @self.bot.event
+        async def on_message(message):
+            if message.author == self.bot.user:
+                return
+
+            contenido = message.content.lower()
+            if contenido.startswith('jarvis') or contenido.startswith('!jarvis'):
+                comando = contenido.split(' ', 1)[1] if ' ' in contenido else ''
+                respuesta = await self.procesar_comando(comando, from_discord=True, admin=False, user_id=message.author.id)
+                await message.channel.send(respuesta)
+            elif 'jarvis' in contenido:
+                respuesta = await self.iniciar_conversacion(message.content, message.author.id)
+                await message.channel.send(respuesta)
+            else:
+                await self.bot.process_commands(message)
+
+    async def iniciar_bot_discord(self):
+        try:
+            self.agregar_registro("Iniciando bot de Discord...")
+            await self.setup_discord_bot()
+            await self.bot.start(DISCORD_TOKEN)
+        except discord.LoginFailure:
+            self.agregar_registro("Error: Token de Discord inválido. Por favor, verifica tu token.")
+        except aiohttp.ClientConnectorError:
+            self.agregar_registro("Error: No se pudo conectar a Discord. Verifica tu conexión a internet.")
+        except Exception as e:
+            self.agregar_registro(f"Error al iniciar el bot de Discord: {e}")
+            logging.error(f"Error al iniciar el bot de Discord: {e}")
+        finally:
+            if self.session:
+                await self.session.close()
+
+    def obtener_control_volumen(self):
+        try:
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            return cast(interface, POINTER(IAudioEndpointVolume))
+        except Exception as e:
+            self.agregar_registro(f"Error al obtener control de volumen: {e}")
+            logging.error(f"Error al obtener control de volumen: {e}")
+            return None
+
+    def bucle_escucha(self):
+        while self.ejecutando:
+            try:
+                with sr.Microphone() as source:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
+                    texto = self.recognizer.recognize_google(audio, language="es-ES")
+                    self.agregar_registro(f"Escuchado: {texto}")
+                    respuesta = asyncio.run(self.procesar_comando(texto))
+                    self.agregar_registro(f"Respuesta: {respuesta}")
+                    if "Ingrese la contraseña de administrador" in respuesta:
+                        self.mostrar_dialogo_contrasena()
+            except sr.WaitTimeoutError:
+                pass
+            except sr.UnknownValueError:
+                pass
+            except sr.RequestError as e:
+                self.agregar_registro(f"Error en el servicio de reconocimiento de voz: {e}")
+            except Exception as e:
+                self.agregar_registro(f"Error inesperado en bucle_escucha: {e}")
+                logging.error(f"Error inesperado en bucle_escucha: {e}")
+                traceback.print_exc()
+
+    async def procesar_comando(self, comando, from_discord=False, admin=False, user_id=None):
+        if not comando:
+            return "¿En qué puedo ayudarte?"
+
+        comando = self.corregir_comando(comando.lower())
+        try:
+            if not self.es_comando_valido(comando):
+                return "Por favor, inicia el comando con 'Jarvis' o '!jarvis'."
+            
+            if self.es_comando_kebab(comando):
+                self.mostrar_imagen_kebab()
+                return "¡Mostrando tu kebab virtual en pantalla completa!"
+            elif any(palabra in comando for palabra in ["apagar", "shutdown"]) and "cancelar" not in comando:
+                return await self.ejecutar_comando_admin(self.apagar_equipo, from_discord, admin)
+            elif any(palabra in comando for palabra in ["reiniciar", "reboot"]) and "cancelar" not in comando:
+                return await self.ejecutar_comando_admin(self.reiniciar_equipo, from_discord, admin)
+            elif "cancelar apagar" in comando or "cancelar apagado" in comando:
+                return await self.cancelar_apagado()
+            elif "cancelar reiniciar" in comando or "cancelar reinicio" in comando:
+                return await self.cancelar_reinicio()
+            elif any(palabra in comando for palabra in ["hola", "saludar", "saluda"]):
+                return "¡Hola! ¿En qué puedo ayudarte?"
+            elif any(palabra in comando for palabra in ["volumen", "sonido", "audio"]):
+                return await self.ajustar_volumen(comando)
+            elif "brillo" in comando:
+                return await self.ajustar_brillo(comando)
+            elif any(palabra in comando for palabra in ["abrir", "ejecutar", "iniciar"]):
+                return await self.abrir_aplicacion(comando)
+            elif "clima" in comando:
+                return "Lo siento, aún no puedo consultar el clima."
+            elif any(palabra in comando for palabra in ["chiste", "broma"]):
+                return "¿Por qué los programadores prefieren el frío? Porque odian los bugs."
+            elif any(palabra in comando for palabra in ["bloquear", "lock"]):
+                return await self.bloquear_equipo()
+            elif "bateria" in comando:
+                return self.obtener_nivel_bateria()
+            elif "desmutear" in comando or "quitar mute" in comando or "activar sonido" in comando:
+                return self.desmutear_sistema()
+            elif "abrir sitio" in comando or "ir a" in comando:
+                return await self.abrir_sitio_web(comando)
+            elif "busca" in comando or "buscar" in comando:
+                return await self.buscar_en_internet(comando)
+            elif "abrir opción" in comando or "abrir opcion" in comando:
+                return await self.abrir_resultado_busqueda(comando)
+            elif "cambiar configuración" in comando:
+                return await self.modificar_configuracion(comando)
+            else:
+                return "Lo siento, no entiendo ese comando. Puedes usar '!ayuda' para ver los comandos disponibles."
+        except Exception as e:
+            self.agregar_registro(f"Error al procesar comando: {e}")
+            return f"Lo siento, ocurrió un error al procesar tu comando: {e}"
+
+    def corregir_comando(self, comando):
+        # Corregir errores comunes de reconocimiento de voz
+        correcciones = {
+            "a pagar": "apagar",
+            "reinicia": "reiniciar",
+            "cancelar pagado": "cancelar apagado",
+            # Añade más correcciones según sea necesario
+        }
+        for error, correccion in correcciones.items():
+            comando = comando.replace(error, correccion)
+        return comando
+
+    async def ejecutar_comando_admin(self, accion, from_discord, admin):
+        if from_discord and not admin:
+            return "Necesitas permisos de administrador para ejecutar este comando. Usa '!jarvis pass153515' primero."
+        elif not from_discord:
+            if self.solicitar_contrasena_gui():
+                return await accion()
+            else:
+                return "Contraseña incorrecta o acción cancelada."
+        else:
+            return await accion()
+
+    def solicitar_contrasena_gui(self):
+        def mostrar_dialogo():
+            password = simpledialog.askstring("Contraseña", "Ingrese la contraseña de administrador:", show='*', parent=self.ventana_registros)
+            self.password_result = password == self.ADMIN_PASSWORD
+        
+        self.password_result = False
+        self.ventana_registros.after(0, mostrar_dialogo)
+        self.ventana_registros.wait_window(self.ventana_registros.focus_get())
+        return self.password_result
+
+    async def apagar_equipo(self):
+        try:
+            self.apagado_programado = True
+            self.agregar_registro("Programando apagado del equipo...")
+            subprocess.run(["shutdown", "/s", "/t", "60"], check=True)
+            return "El equipo se apagará en 1 minuto. Puedes cancelar diciendo 'Jarvis, cancelar apagado'."
+        except subprocess.CalledProcessError as e:
+            self.agregar_registro(f"Error al programar el apagado: {e}")
+            return f"Ocurrió un error al intentar apagar el equipo: {e}"
+
+    async def reiniciar_equipo(self):
+        try:
+            self.reinicio_programado = True
+            self.agregar_registro("Programando reinicio del equipo...")
+            subprocess.run(["shutdown", "/r", "/t", "60"], check=True)
+            return "El equipo se reiniciará en 1 minuto. Puedes cancelar diciendo 'Jarvis, cancelar reinicio'."
+        except subprocess.CalledProcessError as e:
+            self.agregar_registro(f"Error al programar el reinicio: {e}")
+            return f"Ocurrió un error al intentar reiniciar el equipo: {e}"
+
+    async def cancelar_apagado(self):
+        if self.apagado_programado or self.reinicio_programado:
+            try:
+                subprocess.run(["shutdown", "/a"], check=True)
+                self.apagado_programado = False
+                self.reinicio_programado = False
+                self.agregar_registro("Cancelando apagado/reinicio programado...")
+                return "El apagado o reinicio programado ha sido cancelado."
+            except subprocess.CalledProcessError as e:
+                self.agregar_registro(f"Error al cancelar el apagado/reinicio: {e}")
+                return f"Ocurrió un error al intentar cancelar el apagado o reinicio: {e}"
+        else:
+            return "No hay ningún apagado o reinicio programado para cancelar."
+
+    async def cancelar_reinicio(self):
+        return await self.cancelar_apagado()  # Usamos el mismo método para cancelar ambos
+
+    def es_comando_kebab(self, comando):
+        # Utilizamos una expresión regular para buscar variaciones de "un kebab por favor"
+        patron = r'\b(un|1)?\s*k[eé]ba[bp]\s*(por\s*favor|porfavor|porfa|plz|please)?\b'
+        return re.search(patron, comando, re.IGNORECASE) is not None
+
+    async def ajustar_volumen(self, comando):
+        try:
+            nivel = self.extraer_numero(comando, 10)
+            volumen_actual = self.volumen.GetMasterVolumeLevelScalar()
+            
+            if any(palabra in comando for palabra in ["subir", "aumentar", "sube"]):
+                nuevo_volumen = min(1.0, volumen_actual + (nivel / 100))
+            elif any(palabra in comando for palabra in ["bajar", "disminuir", "baja"]):
+                nuevo_volumen = max(0.0, volumen_actual - (nivel / 100))
+            else:
+                return "No entendí cómo ajustar el volumen. Puedes decir 'subir' o 'bajar'."
+
+            self.volumen.SetMasterVolumeLevelScalar(nuevo_volumen, None)
+            volumen_porcentaje = int(nuevo_volumen * 100)
+            return f"Volumen ajustado al {volumen_porcentaje}%."
+        except Exception as e:
+            self.agregar_registro(f"Error al ajustar volumen: {e}")
+            return f"Error al ajustar el volumen: {e}"
+
+    def extraer_numero(self, texto, valor_predeterminado):
+        numeros = re.findall(r'\d+', texto)
+        return int(numeros[0]) if numeros else valor_predeterminado
+
+    async def ajustar_brillo(self, comando):
+        try:
+            if any(palabra in comando for palabra in ["subir", "aumentar", "sube"]):
+                nivel = self.extraer_numero(comando, 10)
+                sbc.set_brightness(f'+{nivel}')
+                return f"Brillo aumentado en {nivel}%."
+            elif any(palabra in comando for palabra in ["bajar", "disminuir", "baja"]):
+                nivel = self.extraer_numero(comando, 10)
+                sbc.set_brightness(f'-{nivel}')
+                return f"Brillo disminuido en {nivel}%."
+            else:
+                return "No entendí cómo ajustar el brillo. Puedes decir 'subir' o 'bajar'."
+        except Exception as e:
+            self.agregar_registro(f"Error al ajustar brillo: {e}")
+            return f"Error al ajustar el brillo: {e}"
+
+    async def abrir_aplicacion(self, comando):
+        for app, path in self.aplicaciones.items():
+            if app in comando:
+                try:
+                    subprocess.Popen(path)
+                    return f"Abriendo {app}."
+                except Exception as e:
+                    self.agregar_registro(f"Error al abrir {app}: {e}")
+                    return f"Error al abrir {app}: {e}"
+        return "No encontré la aplicación que quieres abrir. Asegúrate de mencionar el nombre de una aplicación conocida."
+
+    async def bloquear_equipo(self):
+        try:
+            ctypes.windll.user32.LockWorkStation()
+            return "Equipo bloqueado."
+        except Exception as e:
+            self.agregar_registro(f"Error al bloquear el equipo: {e}")
+            return f"Error al bloquear el equipo: {e}"
+
+    def obtener_nivel_bateria(self):
+        battery = psutil.sensors_battery()
+        if battery:
+            percent = battery.percent
+            power_plugged = battery.power_plugged
+            status = "conectado" if power_plugged else "desconectado"
+            return f"Nivel de batería: {percent}%. El equipo está {status}."
+        else:
+            return "No se pudo obtener información de la batería."
+
+    def desmutear_sistema(self):
+        try:
+            self.volumen.SetMute(0, None)
+            return "Sistema desmuteado."
+        except Exception as e:
+            self.agregar_registro(f"Error al desmutear el sistema: {e}")
+            return f"Error al desmutear el sistema: {e}"
+
+    def crear_ventana_registros(self):
+        self.ventana_registros = tk.Tk()
+        self.ventana_registros.title("Registros de Jarvis")
+        self.ventana_registros.geometry("600x400")
+        
+        fuente_grande = font.Font(family="Helvetica", size=14)
+        self.texto_registros = scrolledtext.ScrolledText(self.ventana_registros, wrap=tk.WORD, font=fuente_grande)
+        self.texto_registros.pack(expand=True, fill='both')
+        
+        self.ventana_registros.after(100, self.procesar_queue)
+
+    def procesar_queue(self):
+        try:
+            while True:
+                mensaje = self.queue.get_nowait()
+                if self.texto_registros:
+                    self.texto_registros.insert(tk.END, mensaje + "\n")
+                    self.texto_registros.see(tk.END)
+        except queue.Empty:
+            pass
+        finally:
+            self.ventana_registros.after(100, self.procesar_queue)
+
+    def agregar_registro(self, mensaje):
+        self.queue.put(mensaje)
+        logging.info(mensaje)
+
+    def crear_icono_bandeja(self):
+        if not os.path.exists(self.icon_path):
+            self.agregar_registro(f"Archivo de icono no encontrado en {self.icon_path}. Continuando sin icono en la bandeja.")
+            return
+
+        try:
+            image = Image.open(self.icon_path)
+            menu = pystray.Menu(pystray.MenuItem("Salir", self.cerrar))
+            self.icon = pystray.Icon("Asistente Asus", image, "Asistente Asus", menu)
+            threading.Thread(target=self.icon.run, daemon=True).start()
+        except Exception as e:
+            self.agregar_registro(f"Error al crear el icono de la bandeja: {e}")
+            logging.error(f"Error al crear el icono de la bandeja: {e}")
+            traceback.print_exc()
+
+    def run_discord_bot(self):
+        self.discord_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.discord_loop)
+        self.discord_loop.run_until_complete(self.iniciar_bot_discord())
+
+    def iniciar(self):
+        try:
+            self.crear_ventana_registros()
+            self.crear_icono_bandeja()
+            
+            self.agregar_registro("Iniciando Jarvis...")
+            
+            threading.Thread(target=self.bucle_escucha, daemon=True).start()
+            threading.Thread(target=self.run_discord_bot, daemon=True).start()
+            
+            self.ventana_registros.mainloop()
+        except Exception as e:
+            self.agregar_registro(f"Error al iniciar el asistente: {e}")
+            logging.error(f"Error al iniciar el asistente: {e}")
+            traceback.print_exc()
+
+    def cerrar(self):
+        self.ejecutando = False
+        if self.icon:
+            self.icon.stop()
+        if self.ventana_registros:
+            self.ventana_registros.quit()
+        if self.discord_loop:
+            self.discord_loop.stop()
+        self.executor.shutdown(wait=False)
+        self.agregar_registro("Jarvis se ha cerrado.")
+        if self.apagado_programado or self.reinicio_programado:
+            os.system("shutdown /a")
+
+    def mostrar_imagen_kebab(self):
+        if not os.path.exists(self.imagen_path):
+            self.agregar_registro(f"Error: No se encontró la imagen del kebab en {self.imagen_path}")
+            return
+
+        def mostrar_imagen():
+            self.ventana_imagen = tk.Toplevel()
+            self.ventana_imagen.title("¡Tu Kebab!")
+            self.ventana_imagen.attributes('-fullscreen', True)
+            self.ventana_imagen.attributes('-topmost', True)
+
+            # Obtener las dimensiones de la pantalla
+            ancho_pantalla = self.ventana_imagen.winfo_screenwidth()
+            alto_pantalla = self.ventana_imagen.winfo_screenheight()
+
+            # Abrir y redimensionar la imagen para que cubra toda la pantalla
+            imagen = Image.open(self.imagen_path)
+            imagen = imagen.resize((ancho_pantalla, alto_pantalla), Image.LANCZOS)
+            foto = ImageTk.PhotoImage(imagen)
+
+            label = tk.Label(self.ventana_imagen, image=foto)
+            label.image = foto  # Mantener una referencia
+            label.pack(fill=tk.BOTH, expand=True)
+
+            # Cerrar la ventana al hacer clic
+            self.ventana_imagen.bind('<Button-1>', lambda e: self.ventana_imagen.destroy())
+            
+            # Cerrar después de 3 segundos
+            self.ventana_imagen.after(3000, self.ventana_imagen.destroy)
+
+        # Ejecutar en el hilo principal de Tkinter
+        if threading.current_thread() == threading.main_thread():
+            mostrar_imagen()
+        else:
+            self.ventana_registros.after(0, mostrar_imagen)
+
+    def mostrar_mensaje_emergente(self, mensaje):
+        def mostrar():
+            ventana = tk.Toplevel()
+            ventana.title("Jarvis")
+            ventana.geometry("300x100")
+            ventana.attributes('-topmost', True)
+            tk.Label(ventana, text=mensaje, wraplength=250).pack(pady=20)
+            ventana.after(3000, ventana.destroy)  # Cerrar después de 3 segundos
+        
+        self.ventana_registros.after(0, mostrar)
+
+    def mostrar_dialogo_contrasena(self):
+        def mostrar():
+            password = simpledialog.askstring("Contraseña", "Ingrese la contraseña de administrador:", show='*')
+            if password == self.ADMIN_PASSWORD:
+                self.agregar_registro("Contraseña correcta. Ejecutando comando administrativo.")
+            else:
+                self.agregar_registro("Contraseña incorrecta. Acción cancelada.")
+        
+        self.ventana_registros.after(0, mostrar)
+
+    def es_comando_valido(self, comando):
+        return comando.startswith("jarvis") or comando.startswith("!jarvis")
+
+    async def abrir_sitio_web(self, comando):
+        sitio = comando.split("sitio")[-1].strip() if "abrir sitio" in comando else comando.split("ir a")[-1].strip()
+        if not sitio.startswith("http"):
+            sitio = "https://" + sitio
+        try:
+            subprocess.Popen(["start", "", sitio], shell=True)
+            return f"Abriendo el sitio web: {sitio}"
+        except Exception as e:
+            self.agregar_registro(f"Error al abrir el sitio web: {e}")
+            return f"Error al abrir el sitio web: {e}"
+
+    async def buscar_en_internet(self, comando):
+        busqueda = comando.split("busca")[-1].strip() if "busca" in comando else comando.split("buscar")[-1].strip()
+        url_busqueda = f"https://www.google.com/search?q={busqueda.replace(' ', '+')}"
+        webbrowser.open(url_busqueda)
+        return f"Buscando '{busqueda}' en Google. Puedes decir 'Jarvis, abrir opción 1' para abrir el primer resultado."
+
+    async def abrir_resultado_busqueda(self, comando):
+        try:
+            opcion = int(comando.split("opción")[-1].strip()) if "opción" in comando else int(comando.split("opcion")[-1].strip())
+            driver = webdriver.Chrome()  # Asegúrate de tener el ChromeDriver instalado y en el PATH
+            driver.get("https://www.google.com")
+            
+            # Esperar a que los resultados de búsqueda estén presentes
+            resultados = WebDriverWait(driver, 10).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.g h3"))
+            )
+            
+            if 0 < opcion <= len(resultados):
+                resultados[opcion - 1].click()
+                driver.quit()
+                return f"Abriendo la opción {opcion} de los resultados de búsqueda."
+            else:
+                driver.quit()
+                return f"No se encontró la opción {opcion}. Por favor, intenta con un número válido."
+        except Exception as e:
+            self.agregar_registro(f"Error al abrir resultado de búsqueda: {e}")
+            return f"Error al abrir resultado de búsqueda: {e}"
+
+    async def iniciar_conversacion(self, mensaje, user_id):
+        return "Lo siento, no puedo iniciar una conversación."
+
+    async def generar_respuesta_ia(self, prompt, user_id):
+        return "Lo siento, no puedo generar respuestas de IA."
+
+def main():
+    asistente = AsistenteAsus()
+    try:
+        asistente.iniciar()
+    except Exception as e:
+        logging.error(f"Error al iniciar el asistente: {e}")
+        traceback.print_exc()
+    finally:
+        asistente.cerrar()
+
+if __name__ == "__main__":
+    main()
